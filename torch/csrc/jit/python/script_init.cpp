@@ -216,7 +216,6 @@ FunctionDefaults calcOverloadedFunctionDefaults(
   }
   return updated_defaults;
 }
-
 } // namespace
 
 bool checkMutableFunctionDefault(const py::object& def_arg) {
@@ -377,7 +376,6 @@ static StrongFunctionPtr script_compile_overloaded_function(
 static StrongFunctionPtr script_compile_function(
     const c10::QualifiedName& name,
     const Def& def,
-    const FunctionDefaults& defaults,
     ResolutionCallback rcb) {
   auto cu = get_python_cu();
   auto defined_functions = cu->define(
@@ -390,8 +388,6 @@ static StrongFunctionPtr script_compile_function(
       true);
   TORCH_INTERNAL_ASSERT(defined_functions.size() == 1);
   auto& defined = defined_functions[0];
-  defined->setSchema(getSchemaWithNameAndDefaults(
-      def.range(), defined->getSchema(), def.name().name(), defaults));
   StrongFunctionPtr ret(std::move(cu), defined);
   didFinishEmitFunction(ret);
   return ret;
@@ -1233,14 +1229,11 @@ void initJitScriptBindings(PyObject* module) {
       });
   m.def(
       "_jit_script_compile",
-      [](const std::string& qualname,
-         const Def& def,
-         ResolutionCallback rcb,
-         const FunctionDefaults& defaults) {
+      [](const std::string& qualname, const Def& def, ResolutionCallback rcb) {
         C10_LOG_API_USAGE_ONCE("torch.script.compile");
         const auto name = c10::QualifiedName(qualname);
         TORCH_INTERNAL_ASSERT(name.name() == def.name().name());
-        return script_compile_function(name, def, defaults, std::move(rcb));
+        return script_compile_function(name, def, std::move(rcb));
       });
   m.def(
       "_jit_script_compile_overload",
@@ -1572,8 +1565,7 @@ void initJitScriptBindings(PyObject* module) {
           "_create_methods",
           [](std::shared_ptr<ConcreteModuleType> concreteType,
              const std::vector<Def>& defs,
-             const std::vector<ResolutionCallback>& rcbs,
-             const std::vector<FunctionDefaults>& defaults) {
+             const std::vector<ResolutionCallback>& rcbs) {
             TORCH_INTERNAL_ASSERT(defs.size() == rcbs.size());
             std::vector<ResolverPtr> resolvers;
             resolvers.reserve(rcbs.size());
@@ -1592,21 +1584,6 @@ void initJitScriptBindings(PyObject* module) {
                 defs,
                 resolvers,
                 &self);
-            // Stitch in default arguments for each Def if provided
-            auto defaults_it = defaults.begin();
-            auto defs_it = defs.begin();
-            while (defs_it != defs.end()) {
-              const auto method_name =
-                  QualifiedName(prefix, (*defs_it).name().name());
-              auto& method = cu->get_function(method_name);
-              method.setSchema(getSchemaWithNameAndDefaults(
-                  defs_it->range(),
-                  method.getSchema(),
-                  at::nullopt,
-                  *defaults_it));
-              ++defs_it;
-              ++defaults_it;
-            }
           });
 
   m.def(

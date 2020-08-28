@@ -217,6 +217,42 @@ TypePtr ScriptTypeParser::parseType(const std::string& str) {
   return parseTypeFromExpr(p.parseExp());
 }
 
+bool checkMutableFunctionDefault(const IValue& def) {
+  // TODO: Renable.
+  // if (def.isList() || def.isGenericDict()) {
+  //   return true;
+  // }
+
+  // if (def.isTuple()) {
+  //   for (auto& elem : def.toTuple()->elements()) {
+  //     if(checkMutableFunctionDefault(elem)) {
+  //       return true;
+  //     }
+  //   }
+  // }
+
+  return false;
+}
+
+void checkMutableFunctionDefaults(
+    const SourceRange& range,
+    const std::vector<IValue>& defaults,
+    const std::vector<Ident>& default_names,
+    const std::vector<Expr>& default_types) {
+  TORCH_INTERNAL_ASSERT(defaults.size() == default_names.size());
+  TORCH_INTERNAL_ASSERT(defaults.size() == default_types.size());
+
+  for (size_t i = 0, e = defaults.size(); i < e; ++i) {
+    if (checkMutableFunctionDefault(defaults[i])) {
+      throw ErrorReport(range)
+          << "Mutable default parameters are not supported because Python binds them to the function"
+          << " and they persist across function calls.\n As a workaround, make the default None and instantiate"
+          << " the default parameter within the body of the function. Found "
+          << default_types[i] << " on parameter " << default_names[i].name();
+    }
+  }
+}
+
 std::vector<IValue> ScriptTypeParser::evaluateDefaults(
     const SourceRange& r,
     const std::vector<Expr>& default_types,
@@ -224,6 +260,38 @@ std::vector<IValue> ScriptTypeParser::evaluateDefaults(
   std::vector<IValue> default_values;
   if (default_exprs.empty())
     return default_values;
+
+  // If any default argument type is BroadcastList, the expression
+  // will be default value will be expanded into a list later.
+  // Use their type contained in the list for evaluating defaults
+  // instead.
+  std::vector<Expr> modified_types;
+  modified_types.reserve(default_types.size());
+  for (auto& ty : default_types) {
+    auto parsed = parseBroadcastList(ty);
+    if (!parsed) {
+      modified_types.emplace_back(ty);
+    } else {
+      auto parsed_type = parsed->first;
+      bool wrap_optional = false;
+      if (auto opt = parsed_type->cast<OptionalType>()) {
+        wrap_optional = true;
+        parsed_type = opt->getElementType();
+      }
+
+      if (auto list = parsed_type->cast<ListType>()) {
+        auto modified_type = wrap_optional
+            ? OptionalType::create(list->getElementType())
+            : list->getElementType();
+        modified_types.emplace_back(
+            Var::create(r, Ident::create(r, modified_type->annotation_str())));
+      } else {
+        TORCH_INTERNAL_ASSERT(
+            "Expected BroadcastList but got ", parsed_type->repr_str());
+      }
+    }
+  }
+
   // To evaluate the default expressions, we create a graph with no inputs,
   // and whose returns are the default values we need.
   // We then run constant prop on this graph and check the results are
@@ -234,7 +302,7 @@ std::vector<IValue> ScriptTypeParser::evaluateDefaults(
   auto tuple_type = Subscript::create(
       r,
       Var::create(r, Ident::create(r, "Tuple")),
-      List<Expr>::create(r, default_types));
+      List<Expr>::create(r, modified_types));
   auto blank_decl = Decl::create(
       r, List<Param>::create(r, {}), Maybe<Expr>::create(r, tuple_type));
 
@@ -260,7 +328,8 @@ std::vector<IValue> ScriptTypeParser::evaluateDefaults(
   // recursively initialize stuff in DecomposeOps.
   GraphOptimizerEnabledGuard guard(false);
   cu.get_function(def.name().name()).run(stack);
-  return stack.at(0).toTuple()->elements();
+  auto defaults = stack.at(0).toTuple()->elements();
+  return defaults;
 }
 
 std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
@@ -273,6 +342,7 @@ std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
   }
   std::vector<Argument> retval;
 
+  std::vector<Ident> default_names;
   std::vector<Expr> default_types;
   std::vector<Expr> default_exprs;
   // gather any non-empty default arguments
@@ -291,6 +361,7 @@ std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
         throw ErrorReport(param.range())
             << "Keyword arguments with defaults need to be type-hinted (TorchScript C++ frontend)";
       }
+      default_names.emplace_back(param.ident());
       default_types.emplace_back(param.type().get());
       default_exprs.emplace_back(def.get());
     }
@@ -298,6 +369,8 @@ std::vector<Argument> ScriptTypeParser::parseArgsFromDecl(
 
   auto default_values =
       evaluateDefaults(decl.range(), default_types, default_exprs);
+  checkMutableFunctionDefaults(
+      decl.range(), default_values, default_names, default_types);
 
   auto defaults_it = default_values.begin();
   for (auto it = params_begin; it != params_end; ++it) {

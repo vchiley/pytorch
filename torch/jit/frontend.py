@@ -161,10 +161,10 @@ def get_jit_class_def(cls, self_name):
         and not is_static_fn(cls, m.__name__)
         and m.__name__ in cls.__dict__
     )
+
     methods = [get_jit_def(method[1],
                            method[0],
                            self_name=self_name) for method in methods]
-
     properties = get_class_properties(cls, self_name)
 
     sourcelines, file_lineno, filename = get_source_lines_and_file(cls, torch._C.ErrorReport.call_stack())
@@ -190,6 +190,7 @@ def get_jit_def(fn, def_name, self_name=None):
             In this case, the `__name__` attribute of the function object is "_forward",
             but we want the result AST to have the name "forward".
         self_name: If this function is a method, what the type name of `self` is.
+        parse_defaults: If True, the default values for functions are parsed in included in the result AST.
     """
     sourcelines, file_lineno, filename = get_source_lines_and_file(fn, torch._C.ErrorReport.call_stack())
     source = ''.join(sourcelines)
@@ -269,12 +270,18 @@ def build_param_list(ctx, py_args, self_name):
             if arg is not None:
                 ctx_range = build_expr(ctx, arg).range()
                 raise NotSupportedError(ctx_range, _vararg_kwarg_err)
-    result = [build_param(ctx, arg, self_name, False) for arg in py_args.args]
-    result += [build_param(ctx, arg, self_name, True) for arg in py_args.kwonlyargs]
+
+    padded_arg_defaults = [None] * (len(py_args.args) - len(py_args.defaults)) + py_args.defaults
+    args_with_defaults = zip(py_args.args, padded_arg_defaults)
+    padded_kw_arg_defaults = [None] * (len(py_args.kwonlyargs) - len(py_args.kw_defaults)) + py_args.kw_defaults
+    kwonlyargs_with_defaults = zip(py_args.kwonlyargs, padded_kw_arg_defaults)
+    result = [build_param(ctx, arg[0], self_name, False, arg[1]) for arg in args_with_defaults]
+    result += [build_param(ctx, arg[0], self_name, True, arg[1]) for arg in kwonlyargs_with_defaults]
+
     return result
 
 
-def build_param(ctx, py_arg, self_name, kwarg_only):
+def build_param(ctx, py_arg, self_name, kwarg_only, default_value=None):
     # NB: In Python3 py_arg is a pair of (str arg, expr? annotation)
     name = py_arg.arg
     r = ctx.make_range(py_arg.lineno, py_arg.col_offset, py_arg.col_offset + len(name))
@@ -284,6 +291,12 @@ def build_param(ctx, py_arg, self_name, kwarg_only):
         annotation_expr = Var(Ident(r, self_name))
     else:
         annotation_expr = EmptyTypeAnnotation(r)
+
+    # Create the appropriate TreeView for the default value if there is one.
+    if default_value:
+        default_value_expr = build_expr(ctx, default_value)
+        return Param(annotation_expr, default_value_expr, Ident(r, name), kwarg_only)
+
     return Param(annotation_expr, Ident(r, name), kwarg_only)
 
 

@@ -6,7 +6,7 @@ import functools
 import warnings
 
 import torch._jit_internal as _jit_internal
-from torch.jit.frontend import get_default_args, get_jit_def
+from torch.jit.frontend import get_jit_def
 from torch.jit._builtins import _find_builtin
 from torch.nn import Module
 from torch._six import get_function_from_type, bind_method
@@ -288,8 +288,7 @@ concrete_type_store = ConcreteTypeStore()
 def create_methods_from_stubs(concrete_type, stubs):
     defs = [m.def_ for m in stubs]
     rcbs = [m.resolution_callback for m in stubs]
-    defaults = [get_default_args(m.original_method) for m in stubs]
-    concrete_type._create_methods(defs, rcbs, defaults)
+    concrete_type._create_methods(defs, rcbs)
 
 def create_script_module(nn_module, stubs_fn, share_types=True):
     """
