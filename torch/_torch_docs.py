@@ -1752,7 +1752,8 @@ add_docstr(torch.conj,
            r"""
 conj(input, *, out=None) -> Tensor
 
-Computes the element-wise conjugate of the given :attr:`input` tensor.
+Computes the element-wise conjugate of the given :attr:`input` tensor. If the input has a non-complex dtype,
+the output tensor shouldn't be mutated.
 
 .. math::
     \text{out}_{i} = conj(\text{input}_{i})
