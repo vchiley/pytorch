@@ -33,8 +33,16 @@ bool isDefined(const c10::optional<Tensor>& t) {
   return t.has_value() && t->defined();
 }
 
+bool isFwGradDefined(const c10::optional<Tensor>& t) {
+  return t.has_value() && t->fw_grad().defined();
+}
+
 Tensor toLegacyTensor(const c10::optional<Tensor>& t) {
   return t.has_value() ? *t : Tensor();
+}
+
+Tensor toLegacyFwGrad(const c10::optional<Tensor>& t) {
+  return t.has_value() ? t->fw_grad() : Tensor();
 }
 
 bool any_variable_defined(variable_list& variables) {
