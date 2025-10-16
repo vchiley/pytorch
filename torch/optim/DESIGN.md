@@ -20,7 +20,7 @@ The Muon optimizer's orthogonalization step requires operating on the **full mat
 - **FSDP**: Shards parameters across data-parallel ranks
 - **Tensor Parallel (TP)**: Shards layers across tensor-parallel ranks
 - **HSDP**: Two-level sharding (shard within node, replicate across nodes)
-- **Expert Parallel (EP)**: Shards expert weights in MoE models across devices
+- **Expert Parallel (EP)**: Distributes different experts to different devices in MoE models. Each expert is an **independent unit** (like PP stages), not sharded.
 - **Context Parallel (CP)**: Replicates parameters but partitions sequence across devices
 - **Pipeline Parallel (PP)**: Partitions model layers across devices
 
@@ -406,12 +406,26 @@ Expert Parallel Dimension (for MoE models)
 │   GPU 0     │   GPU 1     │   GPU 2     │
 │ experts 0-3 │ experts 4-7 │ experts 8-11│
 └─────────────┴─────────────┴─────────────┘
-    ↑ EP Process Group ↑
 ```
 
-**Gather strategy**: `all_gather` update across EP group along `ep_shard_dim`
+**Gather strategy**: **NO gathering across experts** - each expert is an independent unit
 
-**Use case**: Mixture-of-Experts (MoE) models where expert weights are sharded across devices. Each expert's update needs full gathering for orthogonalization.
+**Key insight**: EP is fundamentally different from TP/FSDP. In TP/FSDP, a single logical layer is **sharded** across devices and must be gathered for correct orthogonalization. In EP, each expert is a **complete, independent** logical unit (like a PP stage). Different experts should be orthogonalized separately.
+
+**Use case**: Mixture-of-Experts (MoE) models where different experts reside on different devices. Each expert runs its own optimizer instance.
+
+**EP + TP combination**: If individual experts are TP-sharded (expert weights distributed across multiple devices), then you would:
+1. Gather across TP within each expert (to reconstruct the full expert)
+2. NOT gather across EP (experts remain independent)
+This is similar to how PP + TP works: each stage is independent, but within a stage you gather across TP.
+
+**Implementation for EP + TP**: This is naturally supported by the current API:
+- Each expert (or expert group on one GPU) creates its own optimizer instance
+- Pass only the TP process group for devices sharing that expert's shards
+- Do NOT use EP process group in `create_auto_config()`
+- Example: If Expert 0 is TP-sharded across GPUs 0-1, those GPUs create optimizer with `tp_process_group=tp_pg_expert0`
+
+**Why `create_auto_config()` doesn't need EP-specific logic**: The EP "dimension" isn't about gathering/redistribution - it's about which parameters belong to which expert. Since experts are independent, each simply runs its own optimizer with whatever other parallelism (TP, FSDP, etc.) is used within that expert.
 
 ### Context Parallel (CP)
 
@@ -736,6 +750,31 @@ def validate_pp(pp_pg, pp_stage_id, pp_num_stages):
 **Rule of thumb**: Use distributed config when:
 - Model has 1B+ parameters OR
 - Using 4+ GPUs for data/model parallelism
+
+## Implementation Fixes Needed
+
+### Remove EP from gather_fn
+
+The current implementation in `create_auto_config()` incorrectly includes EP gathering logic:
+
+```python
+# Lines 273-280 in _muon.py - INCORRECT, should be removed
+if "ep_process_group" in state:
+    ep_pg = state["ep_process_group"]
+    ep_shard_dim = state["ep_shard_dim"]
+    ep_world_size = dist.get_world_size(ep_pg)
+    gathered_shards = [torch.zeros_like(result) for _ in range(ep_world_size)]
+    dist.all_gather(gathered_shards, result, group=ep_pg)
+    result = torch.cat(gathered_shards, dim=ep_shard_dim)
+```
+
+**Fix**: Remove this EP gathering logic from both `gather_fn` and `redistribute_fn`. Experts are independent units and should not be gathered together. If users need EP + TP, they should:
+1. Create separate optimizer instances for each expert group
+2. Use only TP process group in `create_auto_config()` for that expert group
+
+### Update Process Group Topologies Documentation
+
+The EP topology diagram should emphasize that there is **no gather arrow** across experts, unlike TP/FSDP where gather arrows connect devices.
 
 ## Future Extensions
 

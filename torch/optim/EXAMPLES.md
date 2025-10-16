@@ -484,12 +484,12 @@ for epoch in range(num_epochs):
 
 ## Expert Parallel (EP)
 
-Expert Parallel shards expert weights in Mixture-of-Experts (MoE) models across GPUs.
+Expert Parallel distributes **different experts to different GPUs** in Mixture-of-Experts (MoE) models. Unlike TP/FSDP where a single layer is sharded, in EP each expert is a complete, independent unit.
 
 ```python
 import torch
 import torch.distributed as dist
-from torch.optim.muon import Muon, create_auto_config
+from torch.optim.muon import Muon
 
 # Initialize process group
 dist.init_process_group(backend="nccl")
@@ -497,12 +497,13 @@ rank = dist.get_rank()
 world_size = dist.get_world_size()
 
 # MoE model with expert parallelism
-# Experts are sharded across GPUs
+# Each GPU holds COMPLETE different experts (not sharded)
 class MoEModel(torch.nn.Module):
     def __init__(self, num_experts=16, expert_dim=1024):
         super().__init__()
-        # Each GPU holds a subset of experts
+        # Each GPU holds a subset of COMPLETE experts
         experts_per_gpu = num_experts // world_size
+        start_expert = rank * experts_per_gpu
         self.experts = torch.nn.ModuleList([
             torch.nn.Linear(expert_dim, expert_dim)
             for _ in range(experts_per_gpu)
@@ -517,16 +518,56 @@ class MoEModel(torch.nn.Module):
 
 model = MoEModel().cuda()
 
-# Create EP process group (all GPUs hold different experts)
-ep_pg = dist.group.WORLD
+# Expert Parallel: Each expert is independent, NO distributed_config needed
+# Each GPU optimizes its own experts independently
+optimizer = Muon(model.parameters(), lr=1e-3)  # No distributed_config!
 
-# Create distributed config for EP
+# Training loop
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        optimizer.zero_grad()
+        loss = model(batch).loss
+        loss.backward()
+        optimizer.step()  # Each GPU orthogonalizes its own experts independently
+```
+
+**Key insight**: In EP, each expert is a **complete, independent** logical unit (similar to PP stages). Experts should NOT be gathered together - each GPU orthogonalizes its own experts independently. This is fundamentally different from TP/FSDP where a single logical layer is sharded and must be gathered.
+
+### EP + TP Hybrid (TP-Sharded Experts)
+
+If individual experts are **TP-sharded** (expert weights distributed across multiple devices), then you need `distributed_config`:
+
+```python
+# Topology: 4 experts, each expert TP-sharded across 2 GPUs = 8 GPUs total
+# GPU 0-1: Expert 0 (TP-sharded)
+# GPU 2-3: Expert 1 (TP-sharded)
+# GPU 4-5: Expert 2 (TP-sharded)
+# GPU 6-7: Expert 3 (TP-sharded)
+
+tp_size = 2
+expert_id = rank // tp_size
+tp_rank = rank % tp_size
+
+# Create TP process group for this expert
+tp_group_ranks = [expert_id * tp_size + i for i in range(tp_size)]
+tp_pg = dist.new_group(tp_group_ranks)
+
+# Apply TP to expert
+from torch.distributed._tensor import DeviceMesh
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel
+
+device_mesh = DeviceMesh("cuda", list(range(tp_size)))
+model = parallelize_module(model, device_mesh, {
+    "experts": ColwiseParallel(),  # TP-shard expert weights
+})
+
+# Use distributed_config for TP (NOT EP!)
+from torch.optim.muon import create_auto_config
 config = create_auto_config(
-    ep_process_group=ep_pg,
-    ep_shard_dim=0  # Expert weights sharded along dim 0
+    tp_process_group=tp_pg,
+    tp_shard_dim=1  # TP sharding within each expert
 )
 
-# Optimizer
 optimizer = Muon(model.parameters(), lr=1e-3, distributed_config=config)
 
 # Training loop
@@ -535,10 +576,12 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         loss = model(batch).loss
         loss.backward()
-        optimizer.step()  # Gathers full expert weights for orthogonalization
+        optimizer.step()  # Gather across TP within each expert, but NOT across experts
 ```
 
-**Key insight**: Expert weights are sharded across GPUs. During orthogonalization, full expert updates must be gathered to maintain mathematical correctness.
+**Key difference**:
+- **EP alone**: Experts are independent complete units, no gathering needed
+- **EP + TP**: Each expert is TP-sharded, so gather **within** each expert (across TP), but NOT **across** experts (across EP)
 
 ---
 

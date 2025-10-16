@@ -57,7 +57,8 @@ Comprehensive testing strategy for Muon distributed optimizer implementation.
 | HSDP | shard + replicate | - | P1 |
 | TP + FSDP | TP + FSDP | 0/1 | P1 |
 | TP + HSDP | TP + shard + replicate | 0/1 | P1 |
-| EP (Expert Parallel) | EP | 0 | P1 |
+| EP (Expert Parallel) | - | - | P1 |
+| EP + TP (TP-sharded experts) | TP | 0/1 | P2 |
 | CP (Context Parallel) | CP | - | P1 |
 | PP (2 stages) | PP | - | P1 |
 | PP (4 stages) | PP | - | P2 |

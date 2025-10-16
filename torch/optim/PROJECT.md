@@ -20,18 +20,22 @@ Add `distributed_config` parameter to Muon with **three user-defined functions**
 
 **Key Design Principle**: These three functions define how distributed orthogonalization works. They receive a flexible `state` dict containing process groups and metadata, enabling support for **any distributed setup** (PyTorch built-in strategies, custom frameworks, or proprietary parallelism).
 
+**Important**: Some parallelism strategies (PP, EP) represent **independent parameter groups** that should be orthogonalized separately, not gathered together. For example, in Expert Parallel (EP), each expert is independent - we don't gather across experts.
+
 **For convenience**, `create_auto_config()` provides pre-built implementations for common PyTorch strategies (FSDP, TP, HSDP, EP, CP, PP, and hybrids). For custom distributed setups, users define their own functions.
 
 ## When to Use distributed_config
 
 **Required for correct orthogonalization:**
-- **Sharded strategies**: FSDP, TP, HSDP, EP, PP, or any hybrid where parameters are sharded across devices
+- **Sharded strategies where parameters are sharded within a logical unit**: FSDP, TP, HSDP, or any hybrid where parameters belonging to the same logical layer/unit are sharded across devices
   - Without `distributed_config`, orthogonalization will operate on shards independently (mathematically incorrect)
 - **Replicated strategies**: CP (Context Parallel) where parameters are replicated
   - Without `distributed_config`, each GPU will redundantly orthogonalize all updates (inefficient)
 
 **Not needed:**
 - Single GPU training
+- **EP (Expert Parallel)**: Each expert is an independent unit that should be orthogonalized separately, similar to PP stages
+- **PP (Pipeline Parallel)**: Each stage runs optimizer independently
 
 **Optional but recommended:**
 - DDP (DistributedDataParallel) - model is fully replicated on each GPU
@@ -39,7 +43,7 @@ Add `distributed_config` parameter to Muon with **three user-defined functions**
   - Using `distributed_config` with DDP coordinates work: each GPU orthogonalizes subset of updates, then broadcasts results
   - Similar to CP (Context Parallel) - both replicate parameters but benefit from work coordination
 
-**Warning:** Using Muon in distributed training (e.g., FSDP, TP) without `distributed_config` will produce incorrect results. Users must configure `distributed_config` when using any sharded parallelism strategy.
+**Warning:** Using Muon in distributed training (e.g., FSDP, TP) without `distributed_config` will produce incorrect results for strategies that shard parameters **within** a logical unit. However, EP and PP represent independent units and should each run their own optimizer instance.
 
 **Debug Mode:**
 - Set `async_gpu_parallelism=False` in `DistributedConfig` to enable sequential debugging mode
@@ -110,7 +114,10 @@ config = create_auto_config(
 )
 
 # Expert Parallel only
-config = create_auto_config(ep_process_group=ep_pg, ep_shard_dim=0)
+# Note: EP is typically NOT used in create_auto_config because experts are independent units.
+# Each expert should have its own optimizer instance, similar to PP stages.
+# However, if experts are TP-sharded, you'd use:
+# config = create_auto_config(tp_process_group=tp_pg, tp_shard_dim=1)
 
 # Context Parallel only
 config = create_auto_config(cp_process_group=cp_pg)

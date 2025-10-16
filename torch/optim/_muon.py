@@ -125,8 +125,6 @@ def create_auto_config(
     tp_shard_dim: Optional[int] = None,
     shard_process_group=None,
     replicate_process_group=None,
-    ep_process_group=None,
-    ep_shard_dim: Optional[int] = None,
     cp_process_group=None,
     pp_process_group=None,
     pp_stage_id: Optional[int] = None,
@@ -145,10 +143,14 @@ def create_auto_config(
     - FSDP (Fully Sharded Data Parallel)
     - TP (Tensor Parallel)
     - HSDP (Hybrid Sharded Data Parallel: shard + replicate)
-    - EP (Expert Parallel for MoE models)
     - CP (Context Parallel for long sequences)
     - PP (Pipeline Parallel)
     - Hybrids: TP+FSDP, TP+HSDP, PP+TP, PP+FSDP, PP+TP+HSDP, etc.
+
+    Note: Expert Parallel (EP) is NOT included because experts are independent units
+    (like PP stages) that should each run their own optimizer instance. If experts
+    are TP-sharded, create separate optimizer instances per expert group using only
+    the TP process group for devices within that expert.
 
     Args:
         fsdp_process_group: Process group for FSDP (parameters sharded across ranks)
@@ -156,8 +158,6 @@ def create_auto_config(
         tp_shard_dim: Dimension along which TP shards parameters (0 or 1)
         shard_process_group: Shard process group for HSDP (within-node sharding)
         replicate_process_group: Replicate process group for HSDP (across-node replication)
-        ep_process_group: Process group for Expert Parallel (expert weights sharded)
-        ep_shard_dim: Dimension along which EP shards expert parameters
         cp_process_group: Process group for Context Parallel (sequence partitioned, params replicated)
         pp_process_group: Process group for Pipeline Parallel (layers partitioned across stages)
         pp_stage_id: This pipeline stage's ID (0 to num_stages-1)
@@ -180,6 +180,12 @@ def create_auto_config(
         ...     tp_shard_dim=1
         ... )
         >>> optimizer = Muon(model.parameters(), lr=1e-3, distributed_config=config)
+
+    Example (EP + TP for TP-sharded experts):
+        >>> # Expert 0 TP-sharded across GPUs 0-1
+        >>> tp_pg_expert0 = dist.new_group([0, 1])
+        >>> config = create_auto_config(tp_process_group=tp_pg_expert0, tp_shard_dim=1)
+        >>> optimizer = Muon(expert0_params, lr=1e-3, distributed_config=config)
     """
     try:
         import torch.distributed as dist
@@ -193,15 +199,12 @@ def create_auto_config(
     has_fsdp = fsdp_process_group is not None
     has_tp = tp_process_group is not None
     has_hsdp = shard_process_group is not None or replicate_process_group is not None
-    has_ep = ep_process_group is not None
     has_cp = cp_process_group is not None
     has_pp = pp_process_group is not None
 
     # Validation
     if has_tp and tp_shard_dim is None:
         raise ValueError("tp_shard_dim must be specified when using Tensor Parallel")
-    if has_ep and ep_shard_dim is None:
-        raise ValueError("ep_shard_dim must be specified when using Expert Parallel")
     if has_pp and (pp_stage_id is None or pp_num_stages is None):
         raise ValueError(
             "pp_stage_id and pp_num_stages must be specified when using Pipeline Parallel"
@@ -230,9 +233,6 @@ def create_auto_config(
     if has_hsdp:
         state["shard_process_group"] = shard_process_group
         state["replicate_process_group"] = replicate_process_group
-    if has_ep:
-        state["ep_process_group"] = ep_process_group
-        state["ep_shard_dim"] = ep_shard_dim
     if has_cp:
         state["cp_process_group"] = cp_process_group
     if has_pp:
@@ -254,7 +254,11 @@ def create_auto_config(
     def gather_fn(update: Tensor, rank: int, state: dict[str, Any]) -> Tensor:
         """Gather full update from shards.
 
-        For hybrid parallelism, gathers are composed in order: TP → EP → FSDP/HSDP/CP
+        For hybrid parallelism, gathers are composed in order: TP → FSDP/HSDP/CP
+
+        Note: EP (Expert Parallel) is NOT included because experts are independent units
+        that should be orthogonalized separately (similar to PP stages). If experts are
+        TP-sharded, use only the TP process group for devices within that expert.
         """
         result = update
 
@@ -268,16 +272,6 @@ def create_auto_config(
             gathered_shards = [torch.zeros_like(result) for _ in range(tp_world_size)]
             dist.all_gather(gathered_shards, result, group=tp_pg)
             result = torch.cat(gathered_shards, dim=tp_shard_dim)
-
-        # Then, gather across EP if present
-        if "ep_process_group" in state:
-            ep_pg = state["ep_process_group"]
-            ep_shard_dim = state["ep_shard_dim"]
-            ep_world_size = dist.get_world_size(ep_pg)
-
-            gathered_shards = [torch.zeros_like(result) for _ in range(ep_world_size)]
-            dist.all_gather(gathered_shards, result, group=ep_pg)
-            result = torch.cat(gathered_shards, dim=ep_shard_dim)
 
         # Then, gather across FSDP if present
         if "fsdp_process_group" in state:
@@ -316,10 +310,14 @@ def create_auto_config(
 
         This reverses the gather operation, scattering the full orthogonalized
         update back to the original sharded form.
+
+        Note: EP (Expert Parallel) is NOT included because experts are independent units
+        that should be orthogonalized separately (similar to PP stages). If experts are
+        TP-sharded, use only the TP process group for devices within that expert.
         """
         result = ortho_update
 
-        # Redistribute in reverse order: FSDP/HSDP/CP → EP → TP
+        # Redistribute in reverse order: FSDP/HSDP/CP → TP
 
         # First, redistribute across FSDP/HSDP if present
         if "fsdp_process_group" in state:
@@ -346,23 +344,6 @@ def create_auto_config(
             # For simplicity, broadcast from rank 0 in CP group
             # (Proper implementation would track ownership via assignments)
             dist.broadcast(result, src=0, group=cp_pg)
-
-        # Then, redistribute across EP if present
-        if "ep_process_group" in state:
-            ep_pg = state["ep_process_group"]
-            ep_rank = dist.get_rank(ep_pg)
-            ep_world_size = dist.get_world_size(ep_pg)
-            ep_shard_dim = state["ep_shard_dim"]
-
-            shard_size = result.shape[ep_shard_dim] // ep_world_size
-            if ep_shard_dim == 0:
-                result = result[
-                    ep_rank * shard_size : (ep_rank + 1) * shard_size, ...
-                ]
-            else:
-                result = result[
-                    ..., ep_rank * shard_size : (ep_rank + 1) * shard_size
-                ]
 
         # Finally, redistribute across TP if present
         if "tp_process_group" in state:
