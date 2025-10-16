@@ -8,7 +8,11 @@ future.
 
 from torch.optim import lr_scheduler as lr_scheduler, swa_utils as swa_utils
 from torch.optim._adafactor import Adafactor as Adafactor
-from torch.optim._muon import Muon as Muon
+from torch.optim._muon import (
+    create_auto_config as create_auto_config,
+    DistributedConfig as DistributedConfig,
+    Muon as Muon,
+)
 from torch.optim.adadelta import Adadelta as Adadelta
 from torch.optim.adagrad import Adagrad as Adagrad
 from torch.optim.adam import Adam as Adam
@@ -52,6 +56,8 @@ __all__ = [
     "Adamax",
     "AdamW",
     "ASGD",
+    "create_auto_config",
+    "DistributedConfig",
     "LBFGS",
     "lr_scheduler",
     "Muon",
