@@ -15,6 +15,8 @@ muon_step(params, grads, momentum_buffers, lr, beta, ns_steps):
         param -= lr * update
 ```
 
+**Note:** Muon's orthogonalization only applies to parameters with 2 or more dimensions (i.e., `len(param.shape) >= 2`). Scalars and 1D tensors (e.g., biases, layer norm parameters) are not handled by the Muon optimizer's orthogonalization step.
+
 ### Challenge 1: Correctness
 
 Muon's orthogonalization step (via `_zeropower_via_newtonschulz` in `_muon.py`) requires operating on the **full tensor** to maintain mathematical correctness. However, distributed training (FSDP, HSDP, Tensor Parallel, Expert Parallel, Context Parallel, Pipeline Parallel, etc.) shards parameters and their updates across devices. Orthogonalizing partial tensors separately produces **incorrect results**.
@@ -31,16 +33,19 @@ In a naive implementation, `_zeropower_via_newtonschulz` would operate on the fu
 
 Add a `distributed_config: DistributedConfig` parameter to `Muon.__init__()` that enables distributed orthogonalization with **zero redundancy** - each parameter is processed exactly once across all devices.
 
+**Note:** When `distributed_config=None` (the default), Muon operates in non-distributed mode using the standard single-device optimizer behavior.
+
 `DistributedConfig` has **three user-defined functions**:
-1. **assign_fn**: Maps each param_idx to a rank that will orthogonalize that update
+1. **assign_fn**: Maps each param_idx to a rank that will orthogonalize the momentum buffer for that parameter
 2. **gather_fn**: Gathers the full momentum buffer from shards (on assigned rank)
 3. **redistribute_fn**: Redistributes (scatters) the orthogonalized update back to shards and/or replicas
 
-Additionally, `DistributedConfig` should have an attached `state` that holds all metadata needed by the three functions above including but not limited to: Process groups (e.g., FSDP, TP, DP process groups), Device meshes, Tensor shapes/dtypes, Communication patterns, Any other distributed training metadata, etc.
+Additionally, `DistributedConfig` includes a `state` dictionary that holds all metadata needed by the three functions above including but not limited to: Process groups (e.g., FSDP, TP, DP process groups), Device meshes, Tensor shapes/dtypes, Communication patterns, Any other distributed training metadata, etc.
 
 Conceptually, the pseudocode is as follows:
 ```python
 state = distributed_config.state
+rank = torch.distributed.get_rank()  # current process rank
 assignments = assign_fn(params, state=state)  # done once in `class Muon`'s `__init__`
 muon_step(params, grads, momentum_buffers, assignments, lr, beta, ns_steps):
     for param_idx, (param, grad, momentum_buffer) in enumerate(zip(params, grads, momentum_buffers)):
@@ -59,26 +64,23 @@ muon_step(params, grads, momentum_buffers, assignments, lr, beta, ns_steps):
 ```
 
 ### Performance / Acceleration
-**Prefetching**: When orthogonalizing an update for parameter N, the momentum buffer for parameter N+1 can be prefetched via `gather_fn` to overlap communication with computation.
+**Prefetching**: When orthogonalizing the momentum buffer for parameter N to produce an update, the momentum buffer for parameter N+1 can be prefetched via `gather_fn` to overlap communication with computation.
 - `prefetch_count`: Controls how many parameters' momentum buffers to prefetch ahead
 - `prefetch_count=0`: Disables prefetching (sequential communication and computation)
 - `prefetch_count=1`: Default behavior (prefetch next parameter's momentum buffer)
 
-**Independent Asynchronous Processing**: Each GPU processes its assigned parameters in parallel.
+**Independent Asynchronous Processing**: GPUs process different parameters simultaneously in parallel, with each GPU working on the subset of parameters assigned to its rank.
 - `async_gpu_parallelism`: Enable/disable parallel processing (default: `True`)
 
 ### Notes on Parallelism:
 - **Sharded**: Parallelism strategies which shard params (such as TP, FSDP, and HSDP's shard dimension) must gather momentum buffer and scatter updates using `gather_fn` and `redistribute_fn` respectively.
-- **Replicated**: Parallelism strategies which replicate params (such as DDP, CP, and HSDP's replicate dimension), do not need to gather momentum buffer since the full replica is already on each GPU, but must still broadcast the orthogonalized update in `redistribute_fn`.
+- **Replicated**: Parallelism strategies which replicate params (such as DDP, CP, and HSDP's replicate dimension) do not need to gather momentum buffer since the full replica is already on each GPU. For these strategies, `gather_fn` should return the local tensor on dst_rank (since it's already complete) and None on other ranks, maintaining the same API contract. However, `redistribute_fn` must still broadcast the orthogonalized update to all replicas.
 - **Independent**: Parallelism strategies which hold independent parameter sets (such as EP, PP), do not need to gather momentum buffer nor distribute updates since the params are independent, but their process groups should still be passed to `assign_fn`'s state to guarantee rank assignment for deduplication of redundant work is done correctly.
+- **Combined Strategies**: Real-world setups often combine multiple parallelism strategies (e.g., FSDP + TP). For these cases, `gather_fn` and `redistribute_fn` should compose operations across all dimensions, and the `create_*_config` helper functions should handle all combinations of parallelism strategies provided.
 
 ### `DistributedConfig` API
 
 ```python
-from dataclasses import dataclass
-from typing import Any, Callable
-from torch import Tensor
-
 @dataclass
 class DistributedConfig:
     """Configuration for distributed Muon training.
@@ -91,6 +93,8 @@ class DistributedConfig:
     # Called once during __init__
     # Signature: assign_fn(params, state) -> {param_idx: rank}
     # Must return an entry for every param_idx in range(len(params))
+    # Common strategy: round-robin assignment across ranks
+    # Future work: load-balanced assignment by parameter size
 
     gather_fn: Callable[[Tensor, int, dict[str, Any]], Tensor | None]
     # For parallelism strategies that need it, gathers the full momentum buffer from shards for orthogonalization
@@ -112,21 +116,25 @@ class DistributedConfig:
 
     async_gpu_parallelism: bool = True
     # If True: Each rank processes its assigned parameters asynchronously in parallel
-    # If False: Sequential processing (easier debugging)
+    # If False: Each rank processes its assigned parameters one at a time (easier debugging)
     # Recommended: False during initial development/debugging, True for production
 
     prefetch_count: int = 1
-    # Number of tensors to prefetch ahead while processing current parameter
+    # Number of tensors to prefetch ahead while processing current tensor
     # 0: Disabled (sequential communication and computation)
     # 1-2: Recommended (overlaps communication with computation)
     # 3+: Higher memory usage, diminishing returns
     # Uses async_op=True in distributed collectives
-    # Expected speedup: ~2x for models with many parameters
+    # Note: Prefetching works independently of async_gpu_parallelism
 ```
 
 ### Quality of Life (QoL) Features
 Parallelism setups are often bespoke. `DistributedConfig` enables users to define `assign_fn`, `gather_fn`, and `redistribute_fn` for their specific implementation of distributed training.
+
 For convenience, we provide helper functions to generate `DistributedConfig` for common distributed training setups:
+- Use `create_processgroup_config()` if you manually created process groups for your parallelism strategy
+- Use `create_devicemesh_config()` if you're using PyTorch's DeviceMesh API
+- Use `create_dtensor_config()` if your model parameters are DTensors
 
 #### Process Group Configuration
 ```python
@@ -203,7 +211,7 @@ def create_dtensor_config(
 
 ## Design Summary / Principles
 
-- **Flexibility**: Works with any parallelism configuration thru `DistributedConfig`.
+- **Flexibility**: Works with any parallelism configuration through `DistributedConfig`.
 - **Simple**: User only needs to specify 3 functions `assign_fn`, `gather_fn`, and `redistribute_fn`.
 - **Quality of Life**: can just use `create_processgroup_config()`, `create_devicemesh_config()`, or `create_dtensor_config()`.
 - **Performant**: `prefetch_count` and `async_gpu_parallelism` enable faster parallel computation.
