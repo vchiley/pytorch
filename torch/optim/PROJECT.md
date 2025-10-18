@@ -500,168 +500,22 @@ Using both `prefetch_count=1` and `async_gpu_parallelism=True` (the defaults) ty
 - Each rank overlaps its own communication and computation
 - All ranks work in parallel on different parameters
 
-## Testing Strategy
+## Testing
 
-### Unit Tests
+For comprehensive testing strategy, implementation details, and correctness validation, see **[TESTING.md](TESTING.md)**.
 
-**Test Individual Components:**
-- **`assign_fn` validation**: Test round-robin distribution, validate all parameters are assigned, validate ranks are within bounds
-- **`gather_fn` correctness**: Test gathering from shards produces correct full tensor on dst_rank, returns None on other ranks
-- **`redistribute_fn` correctness**: Test distributing from src_rank produces correct shards/replicas on all ranks
-- **Helper function outputs**: Verify `create_processgroup_config`, `create_devicemesh_config`, `create_dtensor_config` produce valid `DistributedConfig` instances
+**Summary:**
+- **Unit Tests**: Test `assign_fn`, `gather_fn`, `redistribute_fn`, and helper functions in isolation
+- **Integration Tests**: Verify distributed training produces numerically identical results to single-GPU
+- **Performance Tests**: Benchmark prefetching and async parallelism speedups
+- **Edge Case Tests**: Error handling, invalid inputs, communication failures
+- **User Validation**: Scripts for users to validate their distributed setup
 
-**Test each parallelism strategy in isolation:**
-```python
-# Test FSDP gather/redistribute
-def test_fsdp_gather_redistribute():
-    # Setup FSDP process group with 4 ranks
-    # Create sharded tensor on each rank
-    # Call gather_fn, verify full tensor on dst_rank
-    # Call redistribute_fn, verify correct shards on all ranks
-
-# Test TP gather/redistribute
-def test_tp_gather_redistribute():
-    # Setup TP process group
-    # Create tensor sharded across TP dimension
-    # Verify gather reconstructs full tensor
-    # Verify redistribute produces correct shards
-
-# Test DDP (replicated) behavior
-def test_ddp_gather_redistribute():
-    # Setup DDP process group
-    # Create replicated tensor
-    # Verify gather returns local tensor on dst_rank, None elsewhere
-    # Verify redistribute broadcasts to all replicas
-```
-
-### Integration Tests
-
-**Test Full Optimizer Step:**
-```python
-def test_muon_distributed_equivalence():
-    """
-    Verify distributed and non-distributed Muon produce same results.
-
-    1. Initialize identical models and data
-    2. Run single-GPU training with distributed_config=None
-    3. Run multi-GPU training with distributed_config
-    4. Compare final parameters (should match within numerical tolerance)
-    """
-    # Single-GPU baseline
-    model_single = create_model()
-    optimizer_single = Muon(model_single.parameters(), lr=0.02)
-    train(model_single, optimizer_single, steps=100)
-
-    # Multi-GPU distributed
-    model_distributed = create_model()  # Same initialization
-    optimizer_distributed = Muon(
-        model_distributed.parameters(),
-        lr=0.02,
-        distributed_config=create_processgroup_config(fsdp_pg=...)
-    )
-    train(model_distributed, optimizer_distributed, steps=100)
-
-    # Compare results
-    for p1, p2 in zip(model_single.parameters(), model_distributed.parameters()):
-        torch.testing.assert_close(p1, p2, rtol=1e-5, atol=1e-5)
-```
-
-**Test Combined Parallelism Strategies:**
-```python
-def test_fsdp_tp_combined():
-    """Test FSDP + TP combination"""
-    device_mesh = init_device_mesh("cuda", (2, 4), mesh_dim_names=["dp", "tp"])
-    # Apply parallelism to model
-    config = create_devicemesh_config(device_mesh, ["dp", "tp"])
-    optimizer = Muon(model.parameters(), lr=0.02, distributed_config=config)
-    # Train and verify correctness
-
-def test_hsdp():
-    """Test Hybrid Sharded Data Parallel (FSDP replicate + shard dimensions)"""
-    # Similar structure to above
-```
-
-### Performance Tests
-
-**Verify Optimizations Work:**
-```python
-def test_prefetch_speedup():
-    """Verify prefetching reduces wall-clock time"""
-    # Benchmark with prefetch_count=0
-    time_no_prefetch = benchmark_training(prefetch_count=0)
-
-    # Benchmark with prefetch_count=1
-    time_with_prefetch = benchmark_training(prefetch_count=1)
-
-    # Expect 20-40% speedup in bandwidth-limited scenarios
-    assert time_with_prefetch < time_no_prefetch * 0.9
-
-def test_async_parallelism_speedup():
-    """Verify async GPU parallelism reduces wall-clock time"""
-    # Similar benchmarking approach
-```
-
-### Edge Case Tests
-
-**Test Error Handling:**
-```python
-def test_invalid_assignments():
-    """Test that invalid rank assignments are caught"""
-    # Assign parameter to rank >= world_size
-    # Should raise ValueError
-
-def test_missing_assignments():
-    """Test that missing parameter assignments are caught"""
-    # assign_fn returns dict missing some param_idx
-    # Should raise AssertionError
-
-def test_shape_mismatch():
-    """Test that shape mismatches in gather are caught"""
-    # gather_fn returns wrong shape
-    # Should raise RuntimeError with helpful message
-
-def test_communication_failure():
-    """Test that communication failures propagate correctly"""
-    # Simulate network failure during gather/redistribute
-    # Should raise exception and fail training job
-```
-
-### Correctness Validation for Users
-
-Users can validate their distributed setup produces correct results by comparing against single-GPU baseline:
-
-```python
-# 1. Single-GPU reference
-model_ref = MyModel()
-optimizer_ref = Muon(model_ref.parameters(), lr=0.02)
-for data in dataloader:
-    loss = model_ref(data)
-    loss.backward()
-    optimizer_ref.step()
-
-# 2. Multi-GPU distributed
-model_dist = MyModel()  # Same initialization as model_ref
-model_dist = FSDP(model_dist, ...)
-optimizer_dist = Muon(
-    model_dist.parameters(),
-    lr=0.02,
-    distributed_config=create_processgroup_config(fsdp_pg=model_dist.process_group)
-)
-for data in dataloader:
-    loss = model_dist(data)
-    loss.backward()
-    optimizer_dist.step()
-
-# 3. Compare on rank 0
-if torch.distributed.get_rank() == 0:
-    # Gather parameters from all ranks if needed
-    # Compare with model_ref parameters
-    # Should match within tolerance: torch.testing.assert_close(..., rtol=1e-5, atol=1e-5)
-```
-
-**Expected Tolerance:**
-- **FP32**: `rtol=1e-5, atol=1e-5`
-- **BF16/FP16**: `rtol=1e-3, atol=1e-3` (lower precision accumulates more error)
+**Key Testing Principles:**
+- Distributed must match single-GPU results within numerical tolerance (rtol=1e-5 for FP32)
+- All parallelism strategies (FSDP, TP, DDP, etc.) tested independently and in combination
+- Performance optimizations must provide measurable speedups
+- Comprehensive debugging guide for common failure patterns
 
 ## Implementation Roadmap
 
