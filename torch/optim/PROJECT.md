@@ -534,15 +534,24 @@ This feature will be implemented in phases to ensure correctness and maintainabi
 
 **Success Criteria:** Training runs successfully with FSDP, produces same numerical results as non-distributed (within tolerance)
 
-### Phase 2: Process Group Helpers
-**Goal:** Support common distributed training configurations
+### Phase 2: Advanced Parallelism Support (COMPLETED)
+**Goal:** Support combined parallelism strategies and advanced distributed APIs
 
-- [ ] Extend `create_processgroup_config()` to handle TP, DP, EP, CP, PP
-- [ ] Handle combined parallelism strategies (e.g., FSDP + TP)
-- [ ] Add comprehensive shape validation in gather/redistribute functions
-- [ ] Document expected behavior for each parallelism type
+- [x] Extend `create_processgroup_config()` to handle TP, DP, EP, CP, PP
+- [x] Handle combined parallelism strategies (e.g., FSDP + TP, HSDP)
+- [x] Implement chaining pattern for gather/redistribute in combined strategies
+- [x] Implement `create_devicemesh_config()` for DeviceMesh support
+- [x] Implement `create_dtensor_config()` for DTensor support
+- [x] Add comprehensive tests for combined parallelism strategies
+- [x] Document expected behavior for each parallelism type
 
-**Success Criteria:** Users can easily configure Muon for standard parallelism setups
+**Success Criteria:** Users can easily configure Muon for standard and advanced parallelism setups
+
+**Phase 2 Notes:**
+- Chaining pattern enables clean composition of multiple parallelism strategies
+- DeviceMesh config extracts process groups from mesh topology automatically
+- DTensor config detects sharding from placement specifications
+- All Phase 1 tests continue to pass with Phase 2 additions
 
 ### Phase 3: Prefetching Optimization
 **Goal:** Overlap communication with computation
