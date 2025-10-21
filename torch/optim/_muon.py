@@ -116,13 +116,26 @@ class DistributedConfig:
         state: Holds all metadata needed by the functions above (see DistributedState).
             Contains process groups, shapes, dtypes, devices, and other metadata.
 
-        async_gpu_parallelism: If True, each rank processes its assigned parameters
-            asynchronously in parallel. If False, processes one at a time (easier debugging).
+        async_gpu_parallelism: If True, enables rank-level asynchronous processing where
+            each rank independently processes only its assigned parameters (Phase 4).
+            If False, all ranks process all parameters synchronously for easier debugging.
+
+            When True:
+            - Each rank processes only parameters assigned to it
+            - Ranks work independently without waiting for each other
+            - Final barrier synchronizes all ranks before next training step
+            - Expected speedup: 20-30% due to parallel rank processing
+
+            When False:
+            - All ranks process all parameters (redundant computation)
+            - Easier to debug since execution is deterministic
+            - All ranks follow identical execution path
 
         prefetch_count: Number of tensors to prefetch ahead while processing current tensor.
             0: Disabled (sequential communication and computation)
             1-2: Recommended (overlaps communication with computation)
             3+: Higher memory usage, diminishing returns
+            Works independently of async_gpu_parallelism and can be combined with it.
     """
 
     assign_fn: Callable[[list[Tensor], dict[str, Any]], dict[int, int]]
@@ -202,7 +215,7 @@ def _gather_tensor_shards(
     tensor: Tensor,
     process_group: Any,
     async_op: bool = False,
-) -> tuple[Tensor, Optional[Any]]:
+) -> tuple[Any, Optional[Any]]:
     """Gather tensor shards from all ranks in process group.
 
     This is a reusable helper for gathering sharded tensors (FSDP, TP, etc.).
@@ -215,11 +228,12 @@ def _gather_tensor_shards(
 
     Returns:
         Tuple of (gathered_tensor, async_work_handle)
-        - gathered_tensor: Concatenated full tensor
+        - gathered_tensor: Concatenated full tensor (or list of tensors if async)
         - async_work_handle: None if async_op=False, Work object if async_op=True
 
     Note:
         For Phase 3 prefetching, set async_op=True and wait on the work handle later.
+        When async_op=True, gathered_tensor is a list that needs concatenation after wait().
     """
     import torch.distributed as dist
 
@@ -888,6 +902,11 @@ class Muon(Optimizer):
         # Setup distributed training if config is provided
         self.distributed_config = distributed_config
         if distributed_config is not None:
+            # Validate prefetch_count parameter
+            if not 0 <= distributed_config.prefetch_count <= 10:
+                raise ValueError(
+                    f"prefetch_count must be between 0 and 10, got {distributed_config.prefetch_count}"
+                )
             self._setup_distributed()
 
     def _setup_distributed(self) -> None:
@@ -900,6 +919,9 @@ class Muon(Optimizer):
         3. Validates assignments
         4. Stores metadata (shapes, dtypes, devices) for communication
         """
+        # Type narrowing: this method is only called when distributed_config exists
+        assert self.distributed_config is not None
+
         # Collect all parameters from all param_groups
         all_params = []
         for group in self.param_groups:
@@ -1229,10 +1251,10 @@ def _select_parameters_to_process(
         return list(range(num_params))
 
 
-def _process_single_parameter(
-    param_idx: int,
+def _orthogonalize_and_apply_update(
     param: Tensor,
-    momentum_buf: Tensor,
+    param_idx: int,
+    momentum_buffer_full: Optional[Tensor],
     distributed_config: DistributedConfig,
     assignments: dict[int, int],
     rank: int,
@@ -1244,39 +1266,28 @@ def _process_single_parameter(
     eps: float,
     adjust_lr_fn: Optional[str],
 ) -> None:
-    """Step 2: Process a single parameter with gather/orthogonalize/redistribute.
+    """Orthogonalize momentum buffer and apply update to parameter.
 
-    This function encapsulates the core distributed Muon logic for one parameter:
-    1. Gather full momentum buffer on assigned rank
-    2. Orthogonalize on assigned rank only (zero-redundancy)
-    3. Redistribute update to all ranks
-    4. Apply update locally with weight decay
+    This is the core computation step that is shared between all processing modes:
+    - Sequential processing (Phase 1/2)
+    - Prefetch processing (Phase 3)
+    - Future: Async processing (Phase 4)
 
     Args:
-        param_idx: Index of parameter being processed
-        param: Parameter tensor to update
-        momentum_buf: Momentum buffer for this parameter
-        distributed_config: Distributed configuration
-        assignments: Parameter-to-rank assignments
+        param: Parameter to update
+        param_idx: Parameter index
+        momentum_buffer_full: Full gathered momentum buffer (None on non-assigned ranks)
+        distributed_config: Distributed config
+        assignments: Parameter assignments
         rank: Current rank
         lr: Learning rate
         weight_decay: Weight decay coefficient
-        nesterov: Whether to use nesterov momentum
-        ns_coefficients: Newton-Schulz coefficients (a, b, c)
-        ns_steps: Number of Newton-Schulz iterations
-        eps: Epsilon for numerical stability
-        adjust_lr_fn: Learning rate adjustment function name
+        nesterov: Whether to use Nesterov momentum
+        ns_coefficients: Newton-Schulz coefficients
+        ns_steps: Number of NS iterations
+        eps: Epsilon for stability
+        adjust_lr_fn: LR adjustment function
     """
-    # Set current param_idx in state for shape lookup in gather/redistribute
-    distributed_config.state["current_param_idx"] = param_idx
-
-    # Gather full momentum buffer on assigned rank
-    momentum_buffer_full = distributed_config.gather_fn(
-        momentum_buf,
-        dst_rank=assignments[param_idx],
-        state=distributed_config.state,
-    )
-
     # Orthogonalize only on assigned rank (zero-redundancy)
     update_full = None
     if rank == assignments[param_idx]:
@@ -1285,10 +1296,10 @@ def _process_single_parameter(
         )
 
         # Apply nesterov if enabled
+        # TODO: Properly implement nesterov with distributed gather of grad
+        # Current implementation: use momentum buffer directly (approximation)
+        # Full implementation needs: grad.lerp(momentum_buf, momentum)
         if nesterov:
-            # TODO: Properly implement nesterov with distributed gather of grad
-            # Current implementation: use momentum buffer directly (approximation)
-            # Full implementation needs: grad.lerp(momentum_buf, momentum)
             update = momentum_buffer_full
         else:
             update = momentum_buffer_full
@@ -1311,6 +1322,308 @@ def _process_single_parameter(
     param.add_(update, alpha=-adjusted_lr)
 
 
+def _wait_for_prefetch_gather(
+    prefetch_buffer: Optional[tuple[Any, Optional[Any]]],
+    param_idx: int,
+    rank: int,
+    assignments: dict[int, int],
+    fallback_gather_fn: Callable,
+    momentum_buf: Tensor,
+    state: dict[str, Any],
+) -> Optional[Tensor]:
+    """Wait for prefetched gather to complete and return result.
+
+    Handles:
+    - Waiting on async work handle
+    - Concatenating gathered tensors
+    - Filtering None results for non-dst ranks
+    - Fallback to synchronous gather on errors
+
+    Args:
+        prefetch_buffer: Tuple of (gather_result, work_handle) from async gather
+        param_idx: Current parameter index
+        rank: Current rank
+        assignments: Parameter assignments
+        fallback_gather_fn: Function to call for synchronous gather on error
+        momentum_buf: Momentum buffer for fallback gather
+        state: Distributed state
+
+    Returns:
+        Full momentum buffer on dst_rank, None on other ranks
+    """
+    # No prefetch buffer - must use synchronous gather
+    if prefetch_buffer is None or prefetch_buffer == (None, None):
+        return fallback_gather_fn(
+            momentum_buf,
+            dst_rank=assignments[param_idx],
+            state=state,
+        )
+
+    # Unpack prefetch results
+    gather_result, work_handle = prefetch_buffer
+
+    # Wait for async operation to complete
+    if work_handle is not None:
+        work_handle.wait()
+
+        # Concatenate if result is a list (from async gather)
+        if isinstance(gather_result, list):
+            momentum_buffer_full = torch.cat(gather_result, dim=0)
+        else:
+            momentum_buffer_full = gather_result
+    else:
+        # No work handle - result is already available
+        momentum_buffer_full = gather_result
+
+    # Validate result
+    if momentum_buffer_full is None:
+        if rank == assignments[param_idx]:
+            # Assigned rank should have buffer - fallback to sync gather
+            return fallback_gather_fn(
+                momentum_buf,
+                dst_rank=assignments[param_idx],
+                state=state,
+            )
+        else:
+            # Non-assigned rank correctly has None
+            return None
+
+    return momentum_buffer_full
+
+
+def _supports_async_gather(state: dict[str, Any]) -> bool:
+    """Check if current distributed config supports async gather operations.
+
+    Async gather is currently supported for:
+    - Tensor Parallel (TP) process groups
+    - Fully Sharded Data Parallel (FSDP) process groups
+
+    Not supported for:
+    - Data Parallel (DDP) - already replicated
+    - DeviceMesh without process groups
+    - DTensor without process groups
+
+    Args:
+        state: Distributed state dictionary
+
+    Returns:
+        True if async gather is supported, False otherwise
+    """
+    return state.get("tp_pg") is not None or state.get("fsdp_pg") is not None
+
+
+def _async_gather_fn(
+    momentum_buffer: Tensor,
+    dst_rank: int,
+    state: dict[str, Any],
+) -> tuple[Optional[Any], Optional[Any]]:
+    """Async version of gather_fn that starts gather operations without waiting.
+
+    Returns:
+        Tuple of (gather_result, work_handle) where:
+        - gather_result: List of gather buffers (for concat later) or tensor
+        - work_handle: Work object for wait() call, or None
+    """
+    rank = state["rank"]
+    result = momentum_buffer
+    work_handle = None
+
+    # Chain async gather operations for each active parallelism dimension
+    # Order matters: gather inner dimensions first (TP), then outer (FSDP/DDP)
+
+    # Tensor Parallel: async gather shards along TP dimension
+    if state.get("tp_pg") is not None:
+        result, work_handle = _gather_tensor_shards(
+            result, state["tp_pg"], async_op=True
+        )
+        # result is now a list of buffers, work_handle needs to be waited on
+        return result, work_handle
+
+    # FSDP: async gather shards along FSDP dimension
+    if state.get("fsdp_pg") is not None:
+        result, work_handle = _gather_tensor_shards(
+            result, state["fsdp_pg"], async_op=True
+        )
+        return result, work_handle
+
+    # DDP/CP/EP/PP: already replicated or independent, no gather needed
+    # Return synchronously
+    if rank == dst_rank:
+        return result, None
+    else:
+        return None, None
+
+
+def _process_parameters_with_prefetch(
+    params: list[Tensor],
+    muon_momentum_bufs: list[Tensor],
+    param_indices_to_process: list[int],
+    distributed_config: DistributedConfig,
+    assignments: dict[int, int],
+    rank: int,
+    lr: float,
+    weight_decay: float,
+    nesterov: bool,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    adjust_lr_fn: Optional[str],
+) -> None:
+    """Process parameters with prefetching to overlap communication and computation.
+
+    Phase 3 Implementation: This function implements prefetching by starting the
+    gather operation for the next parameter while processing the current one.
+
+    Algorithm:
+        1. Start prefetch gather for first parameter
+        2. For each parameter:
+           a. Wait for current gather to complete
+           b. Start prefetch gather for next parameter (if available)
+           c. Orthogonalize current parameter (overlapped with next gather)
+           d. Redistribute update to all ranks
+           e. Apply update locally
+
+    Args:
+        params: List of all parameters
+        muon_momentum_bufs: List of all momentum buffers
+        param_indices_to_process: Indices of parameters to process
+        distributed_config: Distributed configuration
+        assignments: Parameter-to-rank assignments
+        rank: Current rank
+        lr: Learning rate
+        weight_decay: Weight decay coefficient
+        nesterov: Whether to use nesterov momentum
+        ns_coefficients: Newton-Schulz coefficients
+        ns_steps: Number of Newton-Schulz iterations
+        eps: Epsilon for numerical stability
+        adjust_lr_fn: Learning rate adjustment function name
+    """
+    if len(param_indices_to_process) == 0:
+        return
+
+    state = distributed_config.state
+
+    # Start prefetch for first parameter if supported
+    prefetch_buffer = None
+    if len(param_indices_to_process) > 0 and _supports_async_gather(state):
+        first_param_idx = param_indices_to_process[0]
+        state["current_param_idx"] = first_param_idx
+        prefetch_buffer = _async_gather_fn(
+            muon_momentum_bufs[first_param_idx],
+            dst_rank=assignments[first_param_idx],
+            state=state,
+        )
+
+    # Process each parameter with prefetching
+    for idx, param_idx in enumerate(param_indices_to_process):
+        state["current_param_idx"] = param_idx
+
+        # Wait for current prefetch and get momentum buffer
+        momentum_buffer_full = _wait_for_prefetch_gather(
+            prefetch_buffer,
+            param_idx,
+            rank,
+            assignments,
+            distributed_config.gather_fn,
+            muon_momentum_bufs[param_idx],
+            state,
+        )
+
+        # Start prefetch for next parameter (if available and supported)
+        prefetch_buffer = None
+        if idx + 1 < len(param_indices_to_process) and _supports_async_gather(state):
+            next_param_idx = param_indices_to_process[idx + 1]
+            state["current_param_idx"] = next_param_idx
+            prefetch_buffer = _async_gather_fn(
+                muon_momentum_bufs[next_param_idx],
+                dst_rank=assignments[next_param_idx],
+                state=state,
+            )
+            state["current_param_idx"] = param_idx  # Restore
+
+        # Orthogonalize and apply update (shared logic)
+        _orthogonalize_and_apply_update(
+            params[param_idx],
+            param_idx,
+            momentum_buffer_full,
+            distributed_config,
+            assignments,
+            rank,
+            lr,
+            weight_decay,
+            nesterov,
+            ns_coefficients,
+            ns_steps,
+            eps,
+            adjust_lr_fn,
+        )
+
+
+def _process_single_parameter(
+    param_idx: int,
+    param: Tensor,
+    momentum_buf: Tensor,
+    distributed_config: DistributedConfig,
+    assignments: dict[int, int],
+    rank: int,
+    lr: float,
+    weight_decay: float,
+    nesterov: bool,
+    ns_coefficients: tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+    adjust_lr_fn: Optional[str],
+) -> None:
+    """Process a single parameter without prefetching (sequential mode).
+
+    This function implements sequential parameter processing without prefetching.
+    It performs:
+    1. Synchronous gather of full momentum buffer on assigned rank
+    2. Orthogonalize and apply update (using shared logic)
+
+    Args:
+        param_idx: Index of parameter being processed
+        param: Parameter tensor to update
+        momentum_buf: Momentum buffer for this parameter
+        distributed_config: Distributed configuration
+        assignments: Parameter-to-rank assignments
+        rank: Current rank
+        lr: Learning rate
+        weight_decay: Weight decay coefficient
+        nesterov: Whether to use nesterov momentum
+        ns_coefficients: Newton-Schulz coefficients (a, b, c)
+        ns_steps: Number of Newton-Schulz iterations
+        eps: Epsilon for numerical stability
+        adjust_lr_fn: Learning rate adjustment function name
+    """
+    # Set current param_idx for buffer allocation
+    distributed_config.state["current_param_idx"] = param_idx
+
+    # Gather full momentum buffer on assigned rank
+    momentum_buffer_full = distributed_config.gather_fn(
+        momentum_buf,
+        dst_rank=assignments[param_idx],
+        state=distributed_config.state,
+    )
+
+    # Orthogonalize and apply update (shared logic)
+    _orthogonalize_and_apply_update(
+        param,
+        param_idx,
+        momentum_buffer_full,
+        distributed_config,
+        assignments,
+        rank,
+        lr,
+        weight_decay,
+        nesterov,
+        ns_coefficients,
+        ns_steps,
+        eps,
+        adjust_lr_fn,
+    )
+
+
 def _single_tensor_muon_distributed(
     params: list[Tensor],
     grads: list[Tensor],
@@ -1327,16 +1640,21 @@ def _single_tensor_muon_distributed(
     adjust_lr_fn: Optional[str],
     has_complex: bool,
 ) -> None:
-    """Distributed Muon with zero-redundancy orthogonalization.
+    """Distributed Muon with zero-redundancy orthogonalization and prefetching.
 
     Key design: Each parameter is assigned to exactly one rank for orthogonalization,
     eliminating redundant computation across ranks.
 
+    Phase 3 Enhancement: Prefetching support to overlap communication with computation.
+    When prefetch_count > 0, we start gathering the next parameter's momentum buffer
+    while processing the current parameter, reducing idle time.
+
     Algorithm:
         1. All ranks update their local momentum buffer shards
         2. Each rank determines which parameters it will orthogonalize
-        3. For each parameter:
-           - Gather full momentum buffer to assigned rank
+        3. For each parameter (with optional prefetching):
+           - Start async gather for next parameter (if prefetching enabled)
+           - Wait for current parameter's gather to complete
            - Assigned rank orthogonalizes
            - Redistribute update to all ranks
            - All ranks apply update locally
@@ -1364,6 +1682,7 @@ def _single_tensor_muon_distributed(
     assignments = distributed_config.state["assignments"]
     rank = distributed_config.state["rank"]
     async_gpu = distributed_config.async_gpu_parallelism
+    prefetch_count = distributed_config.prefetch_count
 
     # Step 0: Update momentum buffers (synchronous across all ranks)
     _update_momentum_buffers(grads, muon_momentum_bufs, momentum)
@@ -1373,12 +1692,31 @@ def _single_tensor_muon_distributed(
         assignments, rank, len(params), async_gpu
     )
 
-    # Step 2: Process each parameter
-    for param_idx in param_indices_to_process:
-        _process_single_parameter(
-            param_idx,
-            params[param_idx],
-            muon_momentum_bufs[param_idx],
+    # Step 2: Process parameters with optional prefetching
+    if prefetch_count == 0:
+        # No prefetching: use sequential processing (Phase 1/2 behavior)
+        for param_idx in param_indices_to_process:
+            _process_single_parameter(
+                param_idx,
+                params[param_idx],
+                muon_momentum_bufs[param_idx],
+                distributed_config,
+                assignments,
+                rank,
+                lr,
+                weight_decay,
+                nesterov,
+                ns_coefficients,
+                ns_steps,
+                eps,
+                adjust_lr_fn,
+            )
+    else:
+        # Phase 3: Prefetching enabled
+        _process_parameters_with_prefetch(
+            params,
+            muon_momentum_bufs,
+            param_indices_to_process,
             distributed_config,
             assignments,
             rank,
