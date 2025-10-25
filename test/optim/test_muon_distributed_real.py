@@ -574,6 +574,142 @@ def _test_muon_comparison_fsdp(rank, world_size, init_method, results_queue):
         results_queue.put((rank, "error", f"{str(e)}\n{traceback.format_exc()}"))
 
 
+def _test_muon_comparison_async(rank, world_size, init_method, results_queue):
+    """DDP with async_gpu_parallelism=True for comparison."""
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+
+        setup_process_group(rank, world_size, backend="nccl", init_method=init_method)
+
+        # Same seed for reproducibility
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Linear(64, 64, bias=False),
+            nn.Linear(64, 32, bias=False),
+        ).to(device)
+
+        # Wrap with DDP
+        model = DDP(model, device_ids=[rank])
+
+        # Create Muon WITH async mode
+        config = create_processgroup_config(
+            dp_pg=dist.group.WORLD,
+            async_gpu_parallelism=True,  # ASYNC ON
+            prefetch_count=0,
+        )
+        optimizer = Muon(model.parameters(), lr=0.02, distributed_config=config)
+
+        # Same fixed input
+        torch.manual_seed(100)
+
+        # Run training
+        losses = []
+        param_snapshots = []
+        for step in range(3):
+            input_data = torch.randn(16, 64, device=device)
+            output = model(input_data)
+            loss = output.sum()
+            losses.append(loss.item())
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Save parameter snapshot
+            params = [p.data.clone().cpu() for p in model.parameters()]
+            param_snapshots.append(params)
+
+        dist.barrier()
+        cleanup_process_group()
+
+        results_queue.put(
+            (
+                rank,
+                "success",
+                {
+                    "losses": losses,
+                    "param_snapshots": param_snapshots,
+                    "mode": "async",
+                },
+            )
+        )
+
+    except Exception as e:
+        import traceback
+
+        cleanup_process_group()
+        results_queue.put((rank, "error", f"{str(e)}\n{traceback.format_exc()}"))
+
+
+def _test_muon_comparison_prefetch(rank, world_size, init_method, results_queue):
+    """DDP with prefetching for comparison."""
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+
+        setup_process_group(rank, world_size, backend="nccl", init_method=init_method)
+
+        # Same seed for reproducibility
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Linear(64, 64, bias=False),
+            nn.Linear(64, 32, bias=False),
+        ).to(device)
+
+        # Wrap with DDP
+        model = DDP(model, device_ids=[rank])
+
+        # Create Muon WITH prefetching
+        config = create_processgroup_config(
+            dp_pg=dist.group.WORLD,
+            async_gpu_parallelism=True,
+            prefetch_count=1,  # PREFETCH ON
+        )
+        optimizer = Muon(model.parameters(), lr=0.02, distributed_config=config)
+
+        # Same fixed input
+        torch.manual_seed(100)
+
+        # Run training
+        losses = []
+        param_snapshots = []
+        for step in range(3):
+            input_data = torch.randn(16, 64, device=device)
+            output = model(input_data)
+            loss = output.sum()
+            losses.append(loss.item())
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Save parameter snapshot
+            params = [p.data.clone().cpu() for p in model.parameters()]
+            param_snapshots.append(params)
+
+        dist.barrier()
+        cleanup_process_group()
+
+        results_queue.put(
+            (
+                rank,
+                "success",
+                {
+                    "losses": losses,
+                    "param_snapshots": param_snapshots,
+                    "mode": "prefetch",
+                },
+            )
+        )
+
+    except Exception as e:
+        import traceback
+
+        cleanup_process_group()
+        results_queue.put((rank, "error", f"{str(e)}\n{traceback.format_exc()}"))
+
+
 def _test_muon_mixed_precision_gpu(rank, world_size, init_method, results_queue):
     """Test Muon with mixed precision training on GPU."""
     try:
@@ -1402,6 +1538,98 @@ class TestMuonRealDistributedGPU(unittest.TestCase):
                 rtol=1e-4,
                 atol=1e-5,
                 msg=f"Parameter {i}: FSDP differs from baseline",
+            )
+
+    def test_async_vs_sync_equivalence(self):
+        """
+        CRITICAL CORRECTNESS TEST: Compare async_gpu_parallelism=False vs True.
+
+        This test verifies that async mode produces numerically equivalent
+        results to sync mode.
+        """
+        # Run sync mode (async=False)
+        sync_results = run_distributed_test(_test_muon_comparison_ddp, world_size=2)
+        sync_rank, sync_status, sync_data = sync_results[0]
+        self.assertEqual(sync_status, "success", "Sync mode test failed")
+
+        # Run async mode (async=True)
+        async_results = run_distributed_test(_test_muon_comparison_async, world_size=2)
+        async_rank, async_status, async_data = async_results[0]
+        self.assertEqual(async_status, "success", "Async mode test failed")
+
+        # Compare losses across configurations
+        sync_losses = sync_data["losses"]
+        async_losses = async_data["losses"]
+
+        # Losses should be close (within tolerance for floating point)
+        for step in range(len(sync_losses)):
+            self.assertAlmostEqual(
+                sync_losses[step],
+                async_losses[step],
+                places=3,
+                msg=f"Step {step}: Async mode loss differs from sync mode",
+            )
+
+        # Compare final parameters
+        sync_params = sync_data["param_snapshots"][-1]
+        async_params = async_data["param_snapshots"][-1]
+
+        # Parameters should be numerically close
+        for i, (sync_p, async_p) in enumerate(zip(sync_params, async_params)):
+            torch.testing.assert_close(
+                sync_p,
+                async_p,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Parameter {i}: Async mode differs from sync mode",
+            )
+
+    def test_prefetch_vs_no_prefetch_equivalence(self):
+        """
+        CRITICAL CORRECTNESS TEST: Compare prefetch_count=0 vs prefetch_count=1.
+
+        This test verifies that prefetching produces numerically equivalent
+        results to non-prefetching.
+        """
+        # Run without prefetching (prefetch_count=0)
+        no_prefetch_results = run_distributed_test(
+            _test_muon_comparison_async, world_size=2
+        )
+        no_prefetch_rank, no_prefetch_status, no_prefetch_data = no_prefetch_results[0]
+        self.assertEqual(no_prefetch_status, "success", "No prefetch test failed")
+
+        # Run with prefetching (prefetch_count=1)
+        prefetch_results = run_distributed_test(
+            _test_muon_comparison_prefetch, world_size=2
+        )
+        prefetch_rank, prefetch_status, prefetch_data = prefetch_results[0]
+        self.assertEqual(prefetch_status, "success", "Prefetch test failed")
+
+        # Compare losses across configurations
+        no_prefetch_losses = no_prefetch_data["losses"]
+        prefetch_losses = prefetch_data["losses"]
+
+        # Losses should be close (within tolerance for floating point)
+        for step in range(len(no_prefetch_losses)):
+            self.assertAlmostEqual(
+                no_prefetch_losses[step],
+                prefetch_losses[step],
+                places=3,
+                msg=f"Step {step}: Prefetch loss differs from no prefetch",
+            )
+
+        # Compare final parameters
+        no_prefetch_params = no_prefetch_data["param_snapshots"][-1]
+        prefetch_params = prefetch_data["param_snapshots"][-1]
+
+        # Parameters should be numerically close
+        for i, (no_pf_p, pf_p) in enumerate(zip(no_prefetch_params, prefetch_params)):
+            torch.testing.assert_close(
+                no_pf_p,
+                pf_p,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Parameter {i}: Prefetch differs from no prefetch",
             )
 
 
