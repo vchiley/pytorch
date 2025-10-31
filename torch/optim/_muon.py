@@ -222,7 +222,7 @@ def _gather_tensor_shards(
     Performs all_gather and concatenates results along dimension 0.
 
     Args:
-        tensor: Local shard to gather
+        tensor: Local shard to gather (may be DTensor or regular tensor)
         process_group: PyTorch process group for communication
         async_op: If True, return async work handle for prefetching (Phase 3)
 
@@ -234,8 +234,19 @@ def _gather_tensor_shards(
     Note:
         For Phase 3 prefetching, set async_op=True and wait on the work handle later.
         When async_op=True, gathered_tensor is a list that needs concatenation after wait().
+        
+        If tensor is a DTensor, it will be converted to local tensor before gathering.
     """
     import torch.distributed as dist
+    
+    # Convert DTensor to local tensor if needed
+    # Process groups extracted from DTensors still expect regular tensors for collectives
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
+    except ImportError:
+        pass  # DTensor not available, tensor must be regular tensor
 
     world_size = dist.get_world_size(process_group)
     gather_list = [torch.empty_like(tensor) for _ in range(world_size)]
@@ -668,7 +679,7 @@ def create_dtensor_config(
 
         DTensor Gather Strategy:
         1. Check if momentum_buffer is a DTensor
-        2. Extract placement specs from DTensor
+        2. Extract placement specs from DTensor and store for redistribution
         3. For Shard placements: use DTensor.redistribute() to gather
         4. For Replicate placements: return local tensor on dst_rank
         5. Convert to local tensor on dst_rank
@@ -689,19 +700,35 @@ def create_dtensor_config(
             )
 
         rank = state["rank"]
+        param_idx = state.get("current_param_idx", -1)
 
         # Check if tensor is a DTensor
         if not isinstance(momentum_buffer, DTensor):
             # Not a DTensor, use standard collective operations
+            # Clear DTensor info for this param
+            if "original_tensor_info" not in state:
+                state["original_tensor_info"] = {}
+            state["original_tensor_info"][param_idx] = None
+            
             # This handles non-DTensor tensors gracefully
             if rank == dst_rank:
                 return momentum_buffer
             else:
                 return None
 
-        # Extract DTensor metadata
+        # Extract and store DTensor metadata for use in redistribute_fn
         device_mesh = momentum_buffer.device_mesh
         placements = momentum_buffer.placements
+        local_shape = momentum_buffer.to_local().shape
+        
+        if "original_tensor_info" not in state:
+            state["original_tensor_info"] = {}
+        state["original_tensor_info"][param_idx] = {
+            "is_dtensor": True,
+            "device_mesh": device_mesh,
+            "placements": placements,
+            "local_shape": local_shape,
+        }
 
         # Strategy: Convert all Shard placements to Replicate
         # This gathers the full tensor on all ranks
@@ -735,9 +762,9 @@ def create_dtensor_config(
 
         DTensor Redistribute Strategy:
         1. On src_rank: have full update tensor
-        2. On other ranks: need to reconstruct DTensor with original placements
-        3. Use DTensor.from_local() to create DTensor with desired placements
-        4. Extract local shard on each rank
+        2. Broadcast full tensor to all ranks
+        3. Extract local shard for each rank based on original DTensor placement
+        4. Convert to DTensor with original placements
 
         Args:
             update: Full update tensor on src_rank, None on other ranks
@@ -745,15 +772,11 @@ def create_dtensor_config(
             state: State dictionary
 
         Returns:
-            Local shard/replica of update tensor
-
-        Note:
-            Current implementation returns a regular tensor, not a DTensor.
-            For full DTensor integration, we'd need to track original DTensor
-            placements and reconstruct DTensors with those placements.
+            DTensor with original placements (if original was DTensor), 
+            or regular tensor (if original was regular tensor)
         """
         try:
-            from torch.distributed.tensor import DTensor
+            from torch.distributed.tensor import DTensor, Shard
         except ImportError:
             raise RuntimeError(
                 "DTensor not available. Please use PyTorch with DTensor support."
@@ -762,24 +785,70 @@ def create_dtensor_config(
         rank = state["rank"]
         param_idx = state.get("current_param_idx", -1)
 
-        # For Phase 2, we implement basic redistribution using standard collectives
-        # Full DTensor integration would require tracking original placements
-        # and using DTensor.from_local() to reconstruct sharded DTensors
+        # Get original tensor info to determine if we need DTensor conversion
+        original_tensor_info = state.get("original_tensor_info", {}).get(param_idx)
 
         # Broadcast full tensor from src_rank to all ranks
-        # This is a simplified implementation that doesn't preserve DTensor structure
         if rank == src_rank:
             assert update is not None, "Source rank must have update tensor"
             output = update.clone() if update is not update else update
+            # Ensure tensor is contiguous before broadcasting (required for DTensor ops)
+            output = output.contiguous()
         else:
             # Allocate buffer for receiving
             output = _allocate_communication_buffer(param_idx, state, shard=False)
 
         # Broadcast update from src_rank
         import torch.distributed as dist
-
         dist.broadcast(output, src=src_rank)
 
+        # If original tensor was a DTensor, convert output to DTensor with same placement
+        if original_tensor_info is not None and original_tensor_info.get("is_dtensor"):
+            device_mesh = original_tensor_info["device_mesh"]
+            placements = original_tensor_info["placements"]
+            local_shape = original_tensor_info["local_shape"]
+
+            # Check if output shape matches local or full shape
+            if output.shape == local_shape:
+                # Output is already local-sized, convert to DTensor
+                return DTensor.from_local(
+                    output,
+                    device_mesh=device_mesh,
+                    placements=placements,
+                    run_check=False,
+                )
+            else:
+                # Output is full-sized, need to extract local shard
+                current_tensor = output
+                
+                # Process each mesh dimension that has sharding
+                for mesh_dim_idx, placement in enumerate(placements):
+                    if isinstance(placement, Shard):
+                        # This mesh dimension has sharding
+                        mesh_size = device_mesh.size(mesh_dim_idx)
+                        rank_in_mesh = device_mesh.get_local_rank(mesh_dim_idx)
+                        shard_dim = placement.dim
+                        
+                        # Calculate shard boundaries
+                        full_size = current_tensor.size(shard_dim)
+                        shard_size = full_size // mesh_size
+                        start_idx = rank_in_mesh * shard_size
+                        end_idx = start_idx + shard_size
+                        
+                        # Extract shard for this dimension
+                        slices = [slice(None)] * current_tensor.ndim
+                        slices[shard_dim] = slice(start_idx, end_idx)
+                        current_tensor = current_tensor[tuple(slices)].contiguous()
+                
+                # Convert to DTensor
+                return DTensor.from_local(
+                    current_tensor,
+                    device_mesh=device_mesh,
+                    placements=placements,
+                    run_check=False,
+                )
+
+        # Not a DTensor, return regular tensor
         return output
 
     return DistributedConfig(
