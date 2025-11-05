@@ -136,6 +136,10 @@ class DistributedConfig:
             1-2: Recommended (overlaps communication with computation)
             3+: Higher memory usage, diminishing returns
             Works independently of async_gpu_parallelism and can be combined with it.
+
+        _async_stream: Optional CUDA stream for isolating async operations from FSDP.
+            Created automatically when async_gpu_parallelism=True on CUDA devices.
+            This prevents conflicts between Muon's async gathers and FSDP's async operations.
     """
 
     assign_fn: Callable[[list[Tensor], dict[str, Any]], dict[int, int]]
@@ -144,6 +148,19 @@ class DistributedConfig:
     state: dict[str, Any]  # Ideally DistributedState, but kept as dict for flexibility
     async_gpu_parallelism: bool = True
     prefetch_count: int = 1
+    _async_stream: Optional[Any] = None  # torch.cuda.Stream, init in __post_init__
+
+    def __post_init__(self):
+        """Initialize async stream if async operations are enabled."""
+        if self.async_gpu_parallelism and torch.cuda.is_available():
+            self._async_stream = torch.cuda.Stream()
+            # Log stream creation for debugging
+            if "rank" in self.state:
+                import logging
+                logging.debug(
+                    f"[Rank {self.state['rank']}] Created async CUDA stream "
+                    f"for Muon optimizer (stream_id={id(self._async_stream)})"
+                )
 
 
 def _validate_assignments(
@@ -211,20 +228,50 @@ def _allocate_communication_buffer(
         return torch.empty(0, dtype=torch.float32, device=torch.cuda.current_device())
 
 
+def _convert_dtensor_to_local(tensor: Tensor) -> Tensor:
+    """Convert DTensor to local tensor if needed.
+
+    This is CRITICAL for async operations with FSDP/DTensor:
+    - DTensor.to_local() is a sync point with FSDP
+    - After conversion, we have a regular tensor safe for async collectives
+    - This prevents conflicts between FSDP's async and Muon's async operations
+
+    Args:
+        tensor: Tensor that may be a DTensor
+
+    Returns:
+        Local tensor (regular tensor, not DTensor)
+    """
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(tensor, DTensor):
+            return tensor.to_local()
+    except ImportError:
+        pass  # DTensor not available
+    return tensor
+
+
 def _gather_tensor_shards(
     tensor: Tensor,
     process_group: Any,
     async_op: bool = False,
+    stream: Optional[Any] = None,
 ) -> tuple[Any, Optional[Any]]:
     """Gather tensor shards from all ranks in process group.
 
     This is a reusable helper for gathering sharded tensors (FSDP, TP, etc.).
     Performs all_gather and concatenates results along dimension 0.
 
+    IMPORTANT: For async operations with DTensor/FSDP:
+    - Caller must convert DTensor to local BEFORE calling this function
+    - Use _convert_dtensor_to_local() helper
+    - This ensures FSDP sync point happens before async collective
+
     Args:
-        tensor: Local shard to gather (may be DTensor or regular tensor)
+        tensor: Local shard to gather (should be regular tensor, not DTensor)
         process_group: PyTorch process group for communication
-        async_op: If True, return async work handle for prefetching (Phase 3)
+        async_op: If True, return async work handle for prefetching
+        stream: Optional CUDA stream to run the gather on (for isolation)
 
     Returns:
         Tuple of (gathered_tensor, async_work_handle)
@@ -232,34 +279,27 @@ def _gather_tensor_shards(
         - async_work_handle: None if async_op=False, Work object if async_op=True
 
     Note:
-        For Phase 3 prefetching, set async_op=True and wait on the work handle later.
         When async_op=True, gathered_tensor is a list that needs concatenation after wait().
-        
-        If tensor is a DTensor, it will be converted to local tensor before gathering.
     """
     import torch.distributed as dist
-    
-    # Convert DTensor to local tensor if needed
-    # Process groups extracted from DTensors still expect regular tensors for collectives
-    try:
-        from torch.distributed.tensor import DTensor
-        if isinstance(tensor, DTensor):
-            tensor = tensor.to_local()
-    except ImportError:
-        pass  # DTensor not available, tensor must be regular tensor
 
     world_size = dist.get_world_size(process_group)
     gather_list = [torch.empty_like(tensor) for _ in range(world_size)]
 
     if async_op:
-        # Phase 3: Async gather for prefetching
-        work = dist.all_gather(gather_list, tensor, group=process_group, async_op=True)
-        # Note: Concatenation must happen after work.wait() in Phase 3
-        # For now, return the gather_list and work handle
+        # Async gather for prefetching
+        # Use separate stream if provided for isolation from FSDP operations
+        if stream is not None and torch.cuda.is_available():
+            with torch.cuda.stream(stream):
+                work = dist.all_gather(gather_list, tensor, group=process_group, async_op=True)
+        else:
+            work = dist.all_gather(gather_list, tensor, group=process_group, async_op=True)
+
+        # Return the gather_list and work handle
         # Caller is responsible for: work.wait(), then torch.cat(gather_list, dim=0)
         return gather_list, work
     else:
-        # Synchronous gather (Phase 1/2)
+        # Synchronous gather
         dist.all_gather(gather_list, tensor, group=process_group)
         result = torch.cat(gather_list, dim=0)
         return result, None
@@ -675,14 +715,19 @@ def create_dtensor_config(
     def gather_fn(
         momentum_buffer: Tensor, dst_rank: int, state: dict[str, Any]
     ) -> Optional[Tensor]:
-        """Gather using DTensor placement.
+        """Gather using DTensor placement (async-safe version).
 
-        DTensor Gather Strategy:
-        1. Check if momentum_buffer is a DTensor
-        2. Extract placement specs from DTensor and store for redistribution
-        3. For Shard placements: use DTensor.redistribute() to gather
-        4. For Replicate placements: return local tensor on dst_rank
-        5. Convert to local tensor on dst_rank
+        DTensor Gather Strategy (FIXED for async operations):
+        1. Convert DTensor to local tensor FIRST (sync point with FSDP)
+        2. Store DTensor metadata for redistribute_fn
+        3. Use all_gather on local tensor (safe for async operations)
+        4. Return full tensor on dst_rank
+
+        CRITICAL: DTensor.redistribute() is synchronous and FSDP-managed.
+        We cannot safely use it in async context. Instead:
+        - Convert to local tensor (unavoidable sync point)
+        - Use standard collectives on local tensors (async-safe)
+        - This prevents conflicts with FSDP's async operations
 
         Args:
             momentum_buffer: Momentum buffer tensor (may be DTensor)
@@ -702,52 +747,48 @@ def create_dtensor_config(
         rank = state["rank"]
         param_idx = state.get("current_param_idx", -1)
 
-        # Check if tensor is a DTensor
-        if not isinstance(momentum_buffer, DTensor):
-            # Not a DTensor, use standard collective operations
-            # Clear DTensor info for this param
+        # Store DTensor metadata if this is a DTensor
+        is_dtensor = isinstance(momentum_buffer, DTensor)
+
+        if is_dtensor:
+            # Extract and store DTensor metadata for use in redistribute_fn
+            device_mesh = momentum_buffer.device_mesh
+            placements = momentum_buffer.placements
+
+            # CRITICAL: Convert to local BEFORE any async operations
+            # This is a sync point with FSDP, but necessary
+            local_momentum = momentum_buffer.to_local()
+            local_shape = local_momentum.shape
+
+            if "original_tensor_info" not in state:
+                state["original_tensor_info"] = {}
+            state["original_tensor_info"][param_idx] = {
+                "is_dtensor": True,
+                "device_mesh": device_mesh,
+                "placements": placements,
+                "local_shape": local_shape,
+            }
+        else:
+            # Not a DTensor
+            local_momentum = momentum_buffer
+
             if "original_tensor_info" not in state:
                 state["original_tensor_info"] = {}
             state["original_tensor_info"][param_idx] = None
-            
-            # This handles non-DTensor tensors gracefully
-            if rank == dst_rank:
-                return momentum_buffer
-            else:
-                return None
 
-        # Extract and store DTensor metadata for use in redistribute_fn
-        device_mesh = momentum_buffer.device_mesh
-        placements = momentum_buffer.placements
-        local_shape = momentum_buffer.to_local().shape
-        
-        if "original_tensor_info" not in state:
-            state["original_tensor_info"] = {}
-        state["original_tensor_info"][param_idx] = {
-            "is_dtensor": True,
-            "device_mesh": device_mesh,
-            "placements": placements,
-            "local_shape": local_shape,
-        }
-
-        # Strategy: Convert all Shard placements to Replicate
-        # This gathers the full tensor on all ranks
-        target_placements = tuple(
-            Replicate() if isinstance(p, Shard) else p for p in placements
-        )
-
-        # Redistribute to replicate all shards
-        if target_placements != placements:
-            full_dtensor = momentum_buffer.redistribute(
-                device_mesh=device_mesh,
-                placements=target_placements,
-            )
+        # Now use all_gather on the local tensor
+        # This is safe for async operations since it's a regular tensor
+        if is_dtensor:
+            # Need to gather from all ranks
+            # Get world process group for gathering
+            import torch.distributed as dist
+            world_size = dist.get_world_size()
+            gather_list = [torch.empty_like(local_momentum) for _ in range(world_size)]
+            dist.all_gather(gather_list, local_momentum)
+            full_tensor = torch.cat(gather_list, dim=0)
         else:
-            # Already replicated
-            full_dtensor = momentum_buffer
-
-        # Convert to local tensor
-        full_tensor = full_dtensor.to_local()
+            # Not sharded, just use as-is
+            full_tensor = local_momentum
 
         # Return only on dst_rank for consistency with gather_fn API
         if rank == dst_rank:
@@ -772,7 +813,7 @@ def create_dtensor_config(
             state: State dictionary
 
         Returns:
-            DTensor with original placements (if original was DTensor), 
+            DTensor with original placements (if original was DTensor),
             or regular tensor (if original was regular tensor)
         """
         try:
@@ -820,7 +861,7 @@ def create_dtensor_config(
             else:
                 # Output is full-sized, need to extract local shard
                 current_tensor = output
-                
+
                 # Process each mesh dimension that has sharding
                 for mesh_dim_idx, placement in enumerate(placements):
                     if isinstance(placement, Shard):
@@ -828,18 +869,18 @@ def create_dtensor_config(
                         mesh_size = device_mesh.size(mesh_dim_idx)
                         rank_in_mesh = device_mesh.get_local_rank(mesh_dim_idx)
                         shard_dim = placement.dim
-                        
+
                         # Calculate shard boundaries
                         full_size = current_tensor.size(shard_dim)
                         shard_size = full_size // mesh_size
                         start_idx = rank_in_mesh * shard_size
                         end_idx = start_idx + shard_size
-                        
+
                         # Extract shard for this dimension
                         slices = [slice(None)] * current_tensor.ndim
                         slices[shard_dim] = slice(start_idx, end_idx)
                         current_tensor = current_tensor[tuple(slices)].contiguous()
-                
+
                 # Convert to DTensor
                 return DTensor.from_local(
                     current_tensor,
@@ -1388,6 +1429,25 @@ def _orthogonalize_and_apply_update(
     # Apply update with weight decay
     adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
     param.mul_(1 - lr * weight_decay)
+
+    # Handle DTensor vs regular tensor
+    # When using processgroup config with DTensors, redistribute_fn returns local tensor
+    # but param is still a DTensor, so we need to convert update to match
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(param, DTensor) and not isinstance(update, DTensor):
+            # Update is a local tensor, but param is a DTensor
+            # Convert update to DTensor with same device_mesh and placements
+            update = DTensor.from_local(
+                update,
+                device_mesh=param.device_mesh,
+                placements=param.placements,
+                run_check=False,
+            )
+    except (ImportError, AttributeError):
+        # DTensor not available or param is not a DTensor
+        pass
+
     param.add_(update, alpha=-adjusted_lr)
 
 
@@ -1488,14 +1548,23 @@ def _async_gather_fn(
 ) -> tuple[Optional[Any], Optional[Any]]:
     """Async version of gather_fn that starts gather operations without waiting.
 
+    CRITICAL FIX: Convert DTensor to local tensor FIRST before async operations.
+    This prevents conflicts with FSDP's async operations.
+
     Returns:
         Tuple of (gather_result, work_handle) where:
         - gather_result: List of gather buffers (for concat later) or tensor
         - work_handle: Work object for wait() call, or None
     """
     rank = state["rank"]
-    result = momentum_buffer
+
+    # CRITICAL: Convert DTensor to local FIRST (sync point with FSDP)
+    # This must happen before any async operations to avoid conflicts
+    result = _convert_dtensor_to_local(momentum_buffer)
     work_handle = None
+
+    # Get async stream for isolation (if available)
+    async_stream = state.get("async_stream")
 
     # Chain async gather operations for each active parallelism dimension
     # Order matters: gather inner dimensions first (TP), then outer (FSDP/DDP)
@@ -1503,7 +1572,7 @@ def _async_gather_fn(
     # Tensor Parallel: async gather shards along TP dimension
     if state.get("tp_pg") is not None:
         result, work_handle = _gather_tensor_shards(
-            result, state["tp_pg"], async_op=True
+            result, state["tp_pg"], async_op=True, stream=async_stream
         )
         # result is now a list of buffers, work_handle needs to be waited on
         return result, work_handle
@@ -1511,7 +1580,7 @@ def _async_gather_fn(
     # FSDP: async gather shards along FSDP dimension
     if state.get("fsdp_pg") is not None:
         result, work_handle = _gather_tensor_shards(
-            result, state["fsdp_pg"], async_op=True
+            result, state["fsdp_pg"], async_op=True, stream=async_stream
         )
         return result, work_handle
 
